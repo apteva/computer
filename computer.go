@@ -8,6 +8,7 @@ import (
 
 	"github.com/apteva/core/pkg/computer"
 	"github.com/apteva/computer/browserbase"
+	"github.com/apteva/computer/local"
 	"github.com/apteva/computer/service"
 )
 
@@ -41,6 +42,8 @@ func New(cfg Config) (computer.Computer, error) {
 		return browserbase.New(cfg.APIKey, cfg.ProjectID, display)
 	case "service":
 		return service.New(cfg.URL, display)
+	case "local":
+		return local.New(display)
 	default:
 		return nil, fmt.Errorf("unknown computer type: %s", cfg.Type)
 	}
