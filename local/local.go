@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/apteva/core/pkg/computer"
@@ -24,7 +25,11 @@ type Computer struct {
 // New creates a local Chrome-backed Computer.
 // Launches headed if DISPLAY is set, headless otherwise.
 func New(display computer.DisplaySize) (*Computer, error) {
-	headless := os.Getenv("DISPLAY") == ""
+	// Mac and Windows always have a display; Linux needs DISPLAY set
+	headless := runtime.GOOS == "linux" && os.Getenv("DISPLAY") == ""
+	if os.Getenv("APTEVA_HEADLESS_BROWSER") == "1" {
+		headless = true
+	}
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.WindowSize(display.Width, display.Height),
