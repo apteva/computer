@@ -174,7 +174,7 @@ func (c *Computer) Execute(action computer.Action) ([]byte, error) {
 
 func (c *Computer) Screenshot() ([]byte, error) {
 	var buf []byte
-	if err := chromedp.Run(c.ctx, chromedp.FullScreenshot(&buf, 90)); err != nil {
+	if err := chromedp.Run(c.ctx, chromedp.FullScreenshot(&buf, 60)); err != nil {
 		return nil, fmt.Errorf("screenshot: %w", err)
 	}
 
@@ -213,7 +213,7 @@ func (c *Computer) scaleToDisplay(data []byte) ([]byte, error) {
 	if format == "png" {
 		err = png.Encode(&out, dst)
 	} else {
-		err = jpeg.Encode(&out, dst, &jpeg.Options{Quality: 90})
+		err = jpeg.Encode(&out, dst, &jpeg.Options{Quality: 60})
 	}
 	if err != nil {
 		return data, nil
