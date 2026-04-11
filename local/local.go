@@ -57,7 +57,16 @@ func New(display computer.DisplaySize) (*Computer, error) {
 		return nil, fmt.Errorf("local chrome: failed to start: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "[BROWSER] Chrome launched: %dx%d headless=%v\n", display.Width, display.Height, headless)
+	// Read actual viewport dimensions (window size includes Chrome UI)
+	var vpWidth, vpHeight int
+	chromedp.Run(ctx, chromedp.Evaluate(`window.innerWidth`, &vpWidth))
+	chromedp.Run(ctx, chromedp.Evaluate(`window.innerHeight`, &vpHeight))
+	if vpWidth > 0 && vpHeight > 0 {
+		display = computer.DisplaySize{Width: vpWidth, Height: vpHeight}
+	}
+
+	fmt.Fprintf(os.Stderr, "[BROWSER] Chrome launched: window=%dx%d viewport=%dx%d headless=%v\n",
+		display.Width, display.Height, vpWidth, vpHeight, headless)
 
 	return &Computer{
 		display:     display,
@@ -73,21 +82,37 @@ func (c *Computer) Execute(action computer.Action) ([]byte, error) {
 		return c.Screenshot()
 
 	case "navigate":
+		fmt.Fprintf(os.Stderr, "[BROWSER] navigate to %s\n", action.URL)
 		if err := chromedp.Run(c.ctx, chromedp.Navigate(action.URL)); err != nil {
 			return nil, fmt.Errorf("navigate: %w", err)
 		}
 		time.Sleep(500 * time.Millisecond)
+		var url string
+		chromedp.Run(c.ctx, chromedp.Location(&url))
+		fmt.Fprintf(os.Stderr, "[BROWSER] navigate done, URL=%s\n", url)
 		return c.Screenshot()
 
 	case "click":
+		var urlBefore string
+		chromedp.Run(c.ctx, chromedp.Location(&urlBefore))
+		fmt.Fprintf(os.Stderr, "[BROWSER] click (%d,%d) on %s (display=%dx%d)\n",
+			action.X, action.Y, urlBefore, c.display.Width, c.display.Height)
 		if err := chromedp.Run(c.ctx,
 			chromedp.MouseClickXY(float64(action.X), float64(action.Y)),
 		); err != nil {
+			fmt.Fprintf(os.Stderr, "[BROWSER] click ERROR: %v\n", err)
 			return nil, fmt.Errorf("click: %w", err)
 		}
 		// Wait for potential navigation to complete
 		chromedp.Run(c.ctx, chromedp.WaitReady("body", chromedp.ByQuery))
 		time.Sleep(200 * time.Millisecond)
+		var urlAfter string
+		chromedp.Run(c.ctx, chromedp.Location(&urlAfter))
+		if urlAfter != urlBefore {
+			fmt.Fprintf(os.Stderr, "[BROWSER] click navigated: %s → %s\n", urlBefore, urlAfter)
+		} else {
+			fmt.Fprintf(os.Stderr, "[BROWSER] click done, URL unchanged: %s\n", urlAfter)
+		}
 		return c.Screenshot()
 
 	case "double_click":
