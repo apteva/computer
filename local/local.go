@@ -3,14 +3,19 @@
 package local
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"os"
 	"runtime"
 	"time"
 
 	"github.com/apteva/core/pkg/computer"
 	"github.com/chromedp/chromedp"
+	"golang.org/x/image/draw"
 )
 
 type Computer struct {
@@ -147,8 +152,49 @@ func (c *Computer) Screenshot() ([]byte, error) {
 	if err := chromedp.Run(c.ctx, chromedp.FullScreenshot(&buf, 90)); err != nil {
 		return nil, fmt.Errorf("screenshot: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "[BROWSER] screenshot: %d bytes, first_bytes=%x\n", len(buf), buf[:4])
+
+	// Downscale if image is larger than declared display size (e.g. Retina 2x)
+	buf, _ = c.scaleToDisplay(buf)
+
 	return buf, nil
+}
+
+// scaleToDisplay resizes a screenshot to match the declared DisplaySize.
+// Handles Retina/HiDPI where Chrome captures at device pixel ratio.
+func (c *Computer) scaleToDisplay(data []byte) ([]byte, error) {
+	// Decode to get actual dimensions
+	img, format, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return data, nil // can't decode, return as-is
+	}
+
+	bounds := img.Bounds()
+	actualW, actualH := bounds.Dx(), bounds.Dy()
+	targetW, targetH := c.display.Width, c.display.Height
+
+	// No scaling needed if already at target size (or smaller)
+	if actualW <= targetW && actualH <= targetH {
+		return data, nil
+	}
+
+	fmt.Fprintf(os.Stderr, "[BROWSER] scaling screenshot %dx%d -> %dx%d\n", actualW, actualH, targetW, targetH)
+
+	// Resize using high-quality interpolation
+	dst := image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), img, bounds, draw.Over, nil)
+
+	// Re-encode
+	var out bytes.Buffer
+	if format == "png" {
+		err = png.Encode(&out, dst)
+	} else {
+		err = jpeg.Encode(&out, dst, &jpeg.Options{Quality: 90})
+	}
+	if err != nil {
+		return data, nil
+	}
+
+	return out.Bytes(), nil
 }
 
 func (c *Computer) DisplaySize() computer.DisplaySize { return c.display }
