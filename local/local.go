@@ -52,6 +52,8 @@ func New(display computer.DisplaySize) (*Computer, error) {
 		return nil, fmt.Errorf("local chrome: failed to start: %w", err)
 	}
 
+	fmt.Fprintf(os.Stderr, "[BROWSER] Chrome launched: %dx%d headless=%v\n", display.Width, display.Height, headless)
+
 	return &Computer{
 		display:     display,
 		ctx:         ctx,
@@ -78,6 +80,8 @@ func (c *Computer) Execute(action computer.Action) ([]byte, error) {
 		); err != nil {
 			return nil, fmt.Errorf("click: %w", err)
 		}
+		// Wait for potential navigation to complete
+		chromedp.Run(c.ctx, chromedp.WaitReady("body", chromedp.ByQuery))
 		time.Sleep(200 * time.Millisecond)
 		return c.Screenshot()
 
@@ -126,7 +130,9 @@ func (c *Computer) Execute(action computer.Action) ([]byte, error) {
 	case "wait":
 		dur := action.Duration
 		if dur <= 0 {
-			dur = 1000
+			dur = 1000 // default 1s
+		} else if dur < 100 {
+			dur = dur * 1000 // Claude sends seconds, convert to ms
 		}
 		time.Sleep(time.Duration(dur) * time.Millisecond)
 		return c.Screenshot()
@@ -141,6 +147,7 @@ func (c *Computer) Screenshot() ([]byte, error) {
 	if err := chromedp.Run(c.ctx, chromedp.FullScreenshot(&buf, 90)); err != nil {
 		return nil, fmt.Errorf("screenshot: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "[BROWSER] screenshot: %d bytes, first_bytes=%x\n", len(buf), buf[:4])
 	return buf, nil
 }
 
