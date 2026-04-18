@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,7 +91,46 @@ func New(display computer.DisplaySize) (*Computer, error) {
 		opts = append(opts, chromedp.Flag("no-sandbox", true))
 	}
 
-	fmt.Fprintf(os.Stderr, "[BROWSER] allocator opts count=%d (no-sandbox=%v)\n", len(opts), runtime.GOOS != "windows")
+	// Windows-specific workarounds for ERR_CONNECTION_RESET. These target
+	// the three most common causes on Windows when Chrome launches but
+	// connections are reset at the TCP/TLS layer:
+	//   1. QUIC handshake rejected by corporate middleboxes / some AVs —
+	//      Chrome tries QUIC first for many hosts, hits RST, should fall
+	//      back to TCP but the reset bubbles up. Disable QUIC to force TCP.
+	//   2. Antivirus / Defender hooking Chrome's network service sandbox.
+	//      Disabling NetworkServiceSandbox lets the network service run
+	//      without the Win32k lockdown that some AVs incompatibly filter.
+	//   3. System proxy auto-detection (WPAD) finding a broken/blocking
+	//      proxy; we do NOT default to --no-proxy-server because many
+	//      legitimate users need system proxies, but it's exposed below.
+	// Skippable via APTEVA_CHROME_DEFAULT_WIN=0 if they turn out to hurt.
+	if runtime.GOOS == "windows" && os.Getenv("APTEVA_CHROME_DEFAULT_WIN") != "0" {
+		opts = append(opts,
+			chromedp.Flag("disable-quic", true),
+			chromedp.Flag("disable-features", "NetworkServiceSandbox,RendererCodeIntegrity"),
+		)
+	}
+
+	// Escape hatch: pass arbitrary Chrome flags via env var, e.g.
+	//   APTEVA_CHROME_FLAGS="--no-proxy-server --disable-features=UseDnsHttpsSvcb"
+	// Useful for quickly validating a fix on a user machine without a
+	// rebuild cycle. Flags may be space-separated; only --key / --key=value
+	// forms are supported (no quoted values).
+	if extra := os.Getenv("APTEVA_CHROME_FLAGS"); extra != "" {
+		for _, tok := range strings.Fields(extra) {
+			tok = strings.TrimPrefix(tok, "--")
+			if eq := strings.IndexByte(tok, '='); eq >= 0 {
+				opts = append(opts, chromedp.Flag(tok[:eq], tok[eq+1:]))
+			} else {
+				opts = append(opts, chromedp.Flag(tok, true))
+			}
+		}
+		fmt.Fprintf(os.Stderr, "[BROWSER] APTEVA_CHROME_FLAGS=%q applied\n", extra)
+	}
+
+	fmt.Fprintf(os.Stderr, "[BROWSER] allocator opts count=%d (no-sandbox=%v win-defaults=%v)\n",
+		len(opts), runtime.GOOS != "windows",
+		runtime.GOOS == "windows" && os.Getenv("APTEVA_CHROME_DEFAULT_WIN") != "0")
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	ctx, cancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(func(format string, args ...any) {
@@ -186,7 +226,28 @@ func New(display computer.DisplaySize) (*Computer, error) {
 	// (which Chrome refuses to sandbox) are visible.
 	var ua string
 	chromedp.Run(ctx, chromedp.Evaluate(`navigator.userAgent`, &ua))
-	fmt.Fprintf(os.Stderr, "[BROWSER] pid=%d uid=%d ua=%q\n", os.Getpid(), os.Getuid(), ua)
+
+	// Probe the network from inside Chrome with a data: URL (no network)
+	// and a real URL to disambiguate "Chrome network stack broken" from
+	// "route to internet broken". Result logs next to each other so the
+	// user can tell at a glance whether the reset is Windows-wide or
+	// only affects real HTTPS.
+	var dataOK, netOK bool
+	dataCtx, dataCancel := context.WithTimeout(ctx, 3*time.Second)
+	chromedp.Run(dataCtx, chromedp.Navigate("data:text/plain,ok"))
+	chromedp.Run(dataCtx, chromedp.Evaluate(`document.body && document.body.innerText==="ok"`, &dataOK))
+	dataCancel()
+
+	netCtx, netCancel := context.WithTimeout(ctx, 6*time.Second)
+	netErr := chromedp.Run(netCtx, chromedp.Evaluate(`
+		fetch('https://www.gstatic.com/generate_204', {cache:'no-store'})
+		  .then(r => r.status === 204)
+		  .catch(() => false)
+	`, &netOK))
+	netCancel()
+
+	fmt.Fprintf(os.Stderr, "[BROWSER] pid=%d uid=%d ua=%q probe_data=%v probe_net=%v probe_err=%v\n",
+		os.Getpid(), os.Getuid(), ua, dataOK, netOK, netErr)
 
 	return c, nil
 }
