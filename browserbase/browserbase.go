@@ -2,46 +2,99 @@
 package browserbase
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
+	"os"
 	"time"
 
 	"github.com/apteva/core/pkg/computer"
 	"github.com/chromedp/chromedp"
 )
 
+// apiBase is the Browserbase REST API root. Override for staging via env.
+const apiBase = "https://api.browserbase.com/v1"
+
+// Options extends what New accepts beyond apiKey/projectID/display. All
+// fields are optional. They correspond 1:1 to the POST /v1/sessions payload
+// documented at https://docs.browserbase.com/reference/api/create-a-session.
+type Options struct {
+	// KeepAlive keeps the session alive after the CDP client disconnects
+	// (paid plans only). Default false.
+	KeepAlive bool `json:"keepAlive,omitempty"`
+
+	// Region pins the session to a Browserbase region:
+	// "us-west-2", "us-east-1", "eu-central-1", "ap-southeast-1".
+	// Default: Browserbase picks nearest.
+	Region string `json:"region,omitempty"`
+
+	// Timeout is the max session duration in seconds. Default and max
+	// depend on plan (Free: 3600).
+	Timeout int `json:"timeout,omitempty"`
+
+	// Proxies: true enables Browserbase's managed residential proxy, or
+	// pass a raw list for custom proxies. Encoded as-is into the request.
+	Proxies any `json:"proxies,omitempty"`
+
+	// Fingerprint settings (device, locales, OS, screen). Opaque — passed through.
+	Fingerprint map[string]any `json:"fingerprint,omitempty"`
+
+	// ExtensionID attaches a previously uploaded Chrome extension to the session.
+	ExtensionID string `json:"extensionId,omitempty"`
+
+	// SolveCaptchas enables Browserbase's managed CAPTCHA solver.
+	SolveCaptchas bool `json:"solveCaptchas,omitempty"`
+
+	// UserMetadata is attached to the session record for later querying.
+	UserMetadata map[string]any `json:"userMetadata,omitempty"`
+}
+
 type Computer struct {
-	apiKey     string
-	projectID  string
-	sessionID  string
-	display    computer.DisplaySize
-	ctx        context.Context
-	cancel     context.CancelFunc
+	apiKey      string
+	projectID   string
+	sessionID   string
+	debugURL    string
+	display     computer.DisplaySize
+	ctx         context.Context
+	cancel      context.CancelFunc
 	allocCancel context.CancelFunc
+	http        *http.Client
 }
 
 // New creates a Browserbase-backed Computer, starts a session, and connects via CDP.
 func New(apiKey, projectID string, display computer.DisplaySize) (*Computer, error) {
+	return NewWithOptions(apiKey, projectID, display, Options{})
+}
+
+// NewWithOptions is New plus the extended configuration in Options.
+func NewWithOptions(apiKey, projectID string, display computer.DisplaySize, opts Options) (*Computer, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("browserbase: api_key is required")
 	}
+	if projectID == "" {
+		// The API requires projectId. Fail fast with a clear message
+		// instead of surfacing a confusing HTTP 400 from the server.
+		return nil, fmt.Errorf("browserbase: project_id is required")
+	}
+
 	c := &Computer{
 		apiKey:    apiKey,
 		projectID: projectID,
 		display:   display,
+		http:      &http.Client{Timeout: 30 * time.Second},
 	}
 
-	connectURL, err := c.createSession()
+	connectURL, err := c.createSession(opts)
 	if err != nil {
 		return nil, fmt.Errorf("browserbase: create session: %w", err)
 	}
 
-	// Connect via chromedp remote allocator — NoModifyURL prevents chromedp from
-	// trying to fetch /json/version on the Browserbase proxy URL
+	// Connect via chromedp remote allocator. NoModifyURL stops chromedp
+	// from probing /json/version on the Browserbase proxy (it doesn't
+	// serve that endpoint).
 	allocCtx, allocCancel := chromedp.NewRemoteAllocator(context.Background(), connectURL,
 		chromedp.NoModifyURL)
 	c.allocCancel = allocCancel
@@ -57,23 +110,80 @@ func New(apiKey, projectID string, display computer.DisplaySize) (*Computer, err
 		return nil, fmt.Errorf("browserbase: connect: %w", err)
 	}
 
+	// Best-effort fetch the live debugger URL. Useful for the TUI /
+	// dashboard "watch live" link. Missing or failing shouldn't abort
+	// the session — the browser still works, we just can't observe it.
+	if dbg, err := c.fetchDebugURL(); err == nil {
+		c.debugURL = dbg
+	} else {
+		fmt.Fprintf(os.Stderr, "[BROWSERBASE] debug URL unavailable: %v\n", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "[BROWSERBASE] session ready id=%s debug=%s display=%dx%d\n",
+		c.sessionID, c.debugURL, display.Width, display.Height)
+
 	return c, nil
 }
 
-func (c *Computer) createSession() (string, error) {
-	body := fmt.Sprintf(`{"projectId":"%s","browserSettings":{"viewport":{"width":%d,"height":%d}}}`,
-		c.projectID, c.display.Width, c.display.Height)
+// sessionCreateRequest is the POST /v1/sessions payload. Fields match
+// Browserbase's documented schema; omitempty means unset values don't
+// override Browserbase's server-side defaults.
+type sessionCreateRequest struct {
+	ProjectID       string                 `json:"projectId"`
+	BrowserSettings map[string]any         `json:"browserSettings,omitempty"`
+	KeepAlive       bool                   `json:"keepAlive,omitempty"`
+	Region          string                 `json:"region,omitempty"`
+	Timeout         int                    `json:"timeout,omitempty"`
+	Proxies         any                    `json:"proxies,omitempty"`
+	ExtensionID     string                 `json:"extensionId,omitempty"`
+	UserMetadata    map[string]any         `json:"userMetadata,omitempty"`
+}
 
-	req, err := http.NewRequest("POST", "https://api.browserbase.com/v1/sessions",
-		strings.NewReader(body))
+type sessionCreateResponse struct {
+	ID         string `json:"id"`
+	Status     string `json:"status"`
+	ConnectURL string `json:"connectUrl"`
+	// The API also returns projectId, createdAt, region, etc.; we only
+	// read the fields we use.
+}
+
+func (c *Computer) createSession(opts Options) (string, error) {
+	bs := map[string]any{
+		"viewport": map[string]int{
+			"width":  c.display.Width,
+			"height": c.display.Height,
+		},
+	}
+	if opts.Fingerprint != nil {
+		bs["fingerprint"] = opts.Fingerprint
+	}
+	if opts.SolveCaptchas {
+		bs["solveCaptchas"] = true
+	}
+
+	req := sessionCreateRequest{
+		ProjectID:       c.projectID,
+		BrowserSettings: bs,
+		KeepAlive:       opts.KeepAlive,
+		Region:          opts.Region,
+		Timeout:         opts.Timeout,
+		Proxies:         opts.Proxies,
+		ExtensionID:     opts.ExtensionID,
+		UserMetadata:    opts.UserMetadata,
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequest("POST", apiBase+"/sessions", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-bb-api-key", c.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-BB-API-Key", c.apiKey)
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := c.http.Do(httpReq)
 	if err != nil {
 		return "", err
 	}
@@ -84,19 +194,94 @@ func (c *Computer) createSession() (string, error) {
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	var result sessionCreateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	c.sessionID = result.ID
+
+	// Browserbase returns status=RUNNING on success. Anything else means
+	// the session failed to start (quota exceeded, invalid region, …).
+	if result.Status != "" && result.Status != "RUNNING" {
+		return "", fmt.Errorf("session started with status=%q (expected RUNNING)", result.Status)
+	}
+	if result.ConnectURL == "" {
+		return "", fmt.Errorf("no connectUrl in session response (id=%s status=%s)", result.ID, result.Status)
+	}
+	return result.ConnectURL, nil
+}
+
+// fetchDebugURL calls GET /v1/sessions/{id}/debug and returns the
+// fullscreen debugger URL. Empty string if the session doesn't expose one.
+func (c *Computer) fetchDebugURL() (string, error) {
+	if c.sessionID == "" {
+		return "", fmt.Errorf("no session id")
+	}
+	url := fmt.Sprintf("%s/sessions/%s/debug", apiBase, c.sessionID)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-BB-API-Key", c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
 	var result struct {
-		ID         string `json:"id"`
-		ConnectURL string `json:"connectUrl"`
+		DebuggerFullscreenURL string `json:"debuggerFullscreenUrl"`
+		DebuggerURL           string `json:"debuggerUrl"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
 	}
-	c.sessionID = result.ID
-
-	if result.ConnectURL == "" {
-		return "", fmt.Errorf("no connectUrl in session response")
+	if result.DebuggerFullscreenURL != "" {
+		return result.DebuggerFullscreenURL, nil
 	}
-	return result.ConnectURL, nil
+	return result.DebuggerURL, nil
+}
+
+// requestRelease ends the session via the official Browserbase lifecycle:
+// POST /v1/sessions/{id} with status=REQUEST_RELEASE. The previous
+// implementation used DELETE /v1/sessions/{id}, which the API does not
+// expose — so sessions leaked until their idle timeout.
+func (c *Computer) requestRelease() error {
+	if c.sessionID == "" {
+		return nil
+	}
+	body, err := json.Marshal(map[string]any{
+		"projectId": c.projectID,
+		"status":    "REQUEST_RELEASE",
+	})
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("%s/sessions/%s", apiBase, c.sessionID)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BB-API-Key", c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
 }
 
 func (c *Computer) Execute(action computer.Action) ([]byte, error) {
@@ -196,6 +381,11 @@ func (c *Computer) CurrentURL() string {
 	return url
 }
 
+// DebugURL returns the Browserbase live-view URL for this session, or ""
+// if not available. Callers can type-assert against this method to expose
+// a "watch live" link in UIs without widening the core Computer interface.
+func (c *Computer) DebugURL() string { return c.debugURL }
+
 func (c *Computer) Close() error {
 	if c.cancel != nil {
 		c.cancel()
@@ -204,16 +394,12 @@ func (c *Computer) Close() error {
 		c.allocCancel()
 	}
 
-	// Close Browserbase session via API
-	if c.sessionID != "" {
-		url := fmt.Sprintf("https://api.browserbase.com/v1/sessions/%s", c.sessionID)
-		req, _ := http.NewRequest("DELETE", url, nil)
-		req.Header.Set("x-bb-api-key", c.apiKey)
-		client := &http.Client{Timeout: 10 * time.Second}
-		if resp, err := client.Do(req); err == nil {
-			resp.Body.Close()
-		}
-		c.sessionID = ""
+	// Officially release the session so Browserbase stops billing minutes.
+	if err := c.requestRelease(); err != nil {
+		fmt.Fprintf(os.Stderr, "[BROWSERBASE] release failed id=%s: %v\n", c.sessionID, err)
+	} else if c.sessionID != "" {
+		fmt.Fprintf(os.Stderr, "[BROWSERBASE] session released id=%s\n", c.sessionID)
 	}
+	c.sessionID = ""
 	return nil
 }

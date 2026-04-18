@@ -226,28 +226,7 @@ func New(display computer.DisplaySize) (*Computer, error) {
 	// (which Chrome refuses to sandbox) are visible.
 	var ua string
 	chromedp.Run(ctx, chromedp.Evaluate(`navigator.userAgent`, &ua))
-
-	// Probe the network from inside Chrome with a data: URL (no network)
-	// and a real URL to disambiguate "Chrome network stack broken" from
-	// "route to internet broken". Result logs next to each other so the
-	// user can tell at a glance whether the reset is Windows-wide or
-	// only affects real HTTPS.
-	var dataOK, netOK bool
-	dataCtx, dataCancel := context.WithTimeout(ctx, 3*time.Second)
-	chromedp.Run(dataCtx, chromedp.Navigate("data:text/plain,ok"))
-	chromedp.Run(dataCtx, chromedp.Evaluate(`document.body && document.body.innerText==="ok"`, &dataOK))
-	dataCancel()
-
-	netCtx, netCancel := context.WithTimeout(ctx, 6*time.Second)
-	netErr := chromedp.Run(netCtx, chromedp.Evaluate(`
-		fetch('https://www.gstatic.com/generate_204', {cache:'no-store'})
-		  .then(r => r.status === 204)
-		  .catch(() => false)
-	`, &netOK))
-	netCancel()
-
-	fmt.Fprintf(os.Stderr, "[BROWSER] pid=%d uid=%d ua=%q probe_data=%v probe_net=%v probe_err=%v\n",
-		os.Getpid(), os.Getuid(), ua, dataOK, netOK, netErr)
+	fmt.Fprintf(os.Stderr, "[BROWSER] pid=%d uid=%d ua=%q\n", os.Getpid(), os.Getuid(), ua)
 
 	return c, nil
 }
