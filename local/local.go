@@ -11,18 +11,38 @@ import (
 	"image/png"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/apteva/core/pkg/computer"
+	"github.com/chromedp/cdproto/emulation"
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	"golang.org/x/image/draw"
 )
+
+// netFailure is one recent network-level failure surfaced by Chrome.
+// Captured via Network.loadingFailed so callers can see the real
+// errorText (e.g. "net::ERR_CONNECTION_RESET") instead of a generic
+// navigate error.
+type netFailure struct {
+	URL       string
+	ErrorText string
+	Canceled  bool
+	At        time.Time
+}
 
 type Computer struct {
 	display     computer.DisplaySize
 	ctx         context.Context
 	cancel      context.CancelFunc
 	allocCancel context.CancelFunc
+
+	// recent network failures captured from CDP, most recent last.
+	failMu     sync.Mutex
+	failures   []netFailure
+	requestURL map[network.RequestID]string // requestID -> URL for loadingFailed lookup
 }
 
 // New creates a local Chrome-backed Computer.
@@ -36,44 +56,159 @@ func New(display computer.DisplaySize) (*Computer, error) {
 		headless = true
 	}
 
+	fmt.Fprintf(os.Stderr, "[BROWSER] start: goos=%s goarch=%s headless=%v display=%dx%d DISPLAY=%q APTEVA_HEADLESS_BROWSER=%q CHROME_BIN=%q PATH_has_chrome=unknown\n",
+		runtime.GOOS, runtime.GOARCH, headless,
+		display.Width, display.Height,
+		os.Getenv("DISPLAY"), os.Getenv("APTEVA_HEADLESS_BROWSER"),
+		os.Getenv("CHROME_BIN"),
+	)
+
+	// In headed mode the OS window has a real chrome bar (tabs, address
+	// bar) ~140px tall that eats into the visible area. Pad the window
+	// height in headed mode only so a human watching sees the same
+	// 1600×800 viewport the agent does. Headless mode has no chrome,
+	// so the request maps 1:1 with no padding.
+	winW, winH := display.Width, display.Height
+	if !headless {
+		winH += 140
+	}
+
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.WindowSize(display.Width, display.Height),
+		chromedp.WindowSize(winW, winH),
 		chromedp.Flag("headless", headless),
 		chromedp.Flag("disable-gpu", headless),
 		chromedp.Flag("no-first-run", true),
 		chromedp.Flag("no-default-browser-check", true),
 		chromedp.Flag("disable-extensions", true),
 		chromedp.Flag("disable-popup-blocking", true),
-		chromedp.Flag("no-sandbox", true),
 	)
+	// --no-sandbox is required on Linux (root/containers) but on Windows
+	// it breaks the network service IPC: Chrome launches and CDP connects,
+	// but every navigation fails with ERR_CONNECTION_RESET because the
+	// network service can't initialize without the sandbox scaffolding.
+	if runtime.GOOS != "windows" {
+		opts = append(opts, chromedp.Flag("no-sandbox", true))
+	}
+
+	fmt.Fprintf(os.Stderr, "[BROWSER] allocator opts count=%d (no-sandbox=%v)\n", len(opts), runtime.GOOS != "windows")
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	ctx, cancel := chromedp.NewContext(allocCtx)
+	ctx, cancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "[BROWSER][cdp] "+format+"\n", args...)
+	}))
+
+	c := &Computer{
+		display:     display,
+		ctx:         ctx,
+		cancel:      cancel,
+		allocCancel: allocCancel,
+		requestURL:  make(map[network.RequestID]string),
+	}
 
 	// Verify Chrome launches by running a simple command
 	if err := chromedp.Run(ctx); err != nil {
 		cancel()
 		allocCancel()
-		return nil, fmt.Errorf("local chrome: failed to start: %w", err)
+		return nil, fmt.Errorf("local chrome: failed to start: %w (goos=%s)", err, runtime.GOOS)
 	}
 
-	// Read actual viewport dimensions (window size includes Chrome UI)
+	// Enable Network + Page domains so we can observe real failure
+	// reasons (errorText) and lifecycle events.
+	if err := chromedp.Run(ctx,
+		network.Enable(),
+		page.Enable(),
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "[BROWSER] warn: failed to enable Network/Page domains: %v\n", err)
+	}
+
+	// Listen for CDP events. This is where the real error from a
+	// navigation shows up on Windows — ERR_CONNECTION_RESET comes
+	// through Network.loadingFailed.errorText, not from chromedp.Run.
+	chromedp.ListenTarget(ctx, func(ev any) {
+		switch e := ev.(type) {
+		case *network.EventRequestWillBeSent:
+			c.failMu.Lock()
+			c.requestURL[e.RequestID] = e.Request.URL
+			c.failMu.Unlock()
+		case *network.EventLoadingFailed:
+			c.failMu.Lock()
+			url := c.requestURL[e.RequestID]
+			delete(c.requestURL, e.RequestID)
+			f := netFailure{URL: url, ErrorText: e.ErrorText, Canceled: bool(e.Canceled), At: time.Now()}
+			c.failures = append(c.failures, f)
+			if len(c.failures) > 32 {
+				c.failures = c.failures[len(c.failures)-32:]
+			}
+			c.failMu.Unlock()
+			fmt.Fprintf(os.Stderr, "[BROWSER][cdp] loadingFailed url=%s err=%s canceled=%v type=%s blocked=%v\n",
+				url, e.ErrorText, e.Canceled, e.Type, e.BlockedReason)
+		case *network.EventResponseReceived:
+			if e.Response != nil && e.Response.Status >= 400 {
+				fmt.Fprintf(os.Stderr, "[BROWSER][cdp] response status=%d url=%s\n", e.Response.Status, e.Response.URL)
+			}
+		case *page.EventFrameNavigated:
+			if e.Frame != nil && e.Frame.ParentID == "" {
+				fmt.Fprintf(os.Stderr, "[BROWSER][cdp] frameNavigated url=%s\n", e.Frame.URL)
+			}
+		}
+	})
+
+	// Pin the viewport to exactly the requested size via CDP's
+	// Emulation.setDeviceMetricsOverride. chromedp.WindowSize() sets the
+	// OS window dimensions, but Chrome (even in headless mode) reserves
+	// a default toolbar height inside its layout, so the actual viewport
+	// ends up ~140px shorter than requested. This override bypasses
+	// window sizing entirely — same approach Puppeteer and Playwright
+	// use — so window.innerWidth/innerHeight match exactly what the
+	// caller asked for. mobile=false keeps desktop layout; deviceScaleFactor=1
+	// avoids retina double-pixel screenshots that would then need
+	// downscaling in scaleToDisplay.
+	if err := chromedp.Run(ctx,
+		emulation.SetDeviceMetricsOverride(
+			int64(display.Width), int64(display.Height), 1, false,
+		),
+	); err != nil {
+		cancel()
+		allocCancel()
+		return nil, fmt.Errorf("local chrome: failed to set viewport: %w", err)
+	}
+
+	// Verify the override stuck.
 	var vpWidth, vpHeight int
 	chromedp.Run(ctx, chromedp.Evaluate(`window.innerWidth`, &vpWidth))
 	chromedp.Run(ctx, chromedp.Evaluate(`window.innerHeight`, &vpHeight))
-	if vpWidth > 0 && vpHeight > 0 {
-		display = computer.DisplaySize{Width: vpWidth, Height: vpHeight}
-	}
 
-	fmt.Fprintf(os.Stderr, "[BROWSER] Chrome launched: window=%dx%d viewport=%dx%d headless=%v\n",
+	fmt.Fprintf(os.Stderr, "[BROWSER] Chrome launched: requested=%dx%d viewport=%dx%d headless=%v\n",
 		display.Width, display.Height, vpWidth, vpHeight, headless)
 
-	return &Computer{
-		display:     display,
-		ctx:         ctx,
-		cancel:      cancel,
-		allocCancel: allocCancel,
-	}, nil
+	// User agent + process identity can affect sandbox / network-service
+	// behavior on Windows. Log both so issues like "running as Admin"
+	// (which Chrome refuses to sandbox) are visible.
+	var ua string
+	chromedp.Run(ctx, chromedp.Evaluate(`navigator.userAgent`, &ua))
+	fmt.Fprintf(os.Stderr, "[BROWSER] pid=%d uid=%d ua=%q\n", os.Getpid(), os.Getuid(), ua)
+
+	return c, nil
+}
+
+func firstFailText(fs []netFailure) string {
+	if len(fs) == 0 {
+		return ""
+	}
+	return fs[0].ErrorText
+}
+
+// recentFailures returns failures observed since t (inclusive).
+func (c *Computer) recentFailures(since time.Time) []netFailure {
+	c.failMu.Lock()
+	defer c.failMu.Unlock()
+	out := make([]netFailure, 0, len(c.failures))
+	for _, f := range c.failures {
+		if !f.At.Before(since) {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func (c *Computer) Execute(action computer.Action) ([]byte, error) {
@@ -82,14 +217,30 @@ func (c *Computer) Execute(action computer.Action) ([]byte, error) {
 		return c.Screenshot()
 
 	case "navigate":
+		started := time.Now()
 		fmt.Fprintf(os.Stderr, "[BROWSER] navigate to %s\n", action.URL)
-		if err := chromedp.Run(c.ctx, chromedp.Navigate(action.URL)); err != nil {
-			return nil, fmt.Errorf("navigate: %w", err)
-		}
+		runErr := chromedp.Run(c.ctx, chromedp.Navigate(action.URL))
 		time.Sleep(500 * time.Millisecond)
-		var url string
+		var url, title, readyState string
 		chromedp.Run(c.ctx, chromedp.Location(&url))
-		fmt.Fprintf(os.Stderr, "[BROWSER] navigate done, URL=%s\n", url)
+		chromedp.Run(c.ctx, chromedp.Title(&title))
+		chromedp.Run(c.ctx, chromedp.Evaluate(`document.readyState`, &readyState))
+		fails := c.recentFailures(started)
+		fmt.Fprintf(os.Stderr, "[BROWSER] navigate done: URL=%s title=%q readyState=%s cdpErr=%v netFailures=%d\n",
+			url, title, readyState, runErr, len(fails))
+		for _, f := range fails {
+			fmt.Fprintf(os.Stderr, "[BROWSER]   failure: %s → %s (canceled=%v)\n", f.URL, f.ErrorText, f.Canceled)
+		}
+		if runErr != nil {
+			return nil, fmt.Errorf("navigate: %w (netFailures=%d first=%s)", runErr, len(fails), firstFailText(fails))
+		}
+		// Chrome reports CONNECTION_RESET via CDP even when chromedp.Navigate
+		// returns nil. If the main-document request failed and we're still
+		// on about:blank, surface that as an error instead of silently
+		// returning a blank screenshot.
+		if (url == "" || url == "about:blank") && len(fails) > 0 {
+			return nil, fmt.Errorf("navigate reached no page: %s (see [BROWSER] logs)", firstFailText(fails))
+		}
 		return c.Screenshot()
 
 	case "click":
