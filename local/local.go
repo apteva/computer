@@ -16,6 +16,7 @@ import (
 
 	"github.com/apteva/core/pkg/computer"
 	"github.com/chromedp/cdproto/emulation"
+	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/chromedp"
 	"golang.org/x/image/draw"
 )
@@ -230,19 +231,7 @@ func (c *Computer) Execute(action computer.Action) ([]byte, error) {
 		return c.Screenshot()
 
 	case "scroll":
-		deltaY := 0
-		amount := action.Amount
-		if amount == 0 {
-			amount = 3
-		}
-		switch action.Direction {
-		case "up":
-			deltaY = -100 * amount
-		case "down":
-			deltaY = 100 * amount
-		}
-		js := fmt.Sprintf("window.scrollBy(0, %d)", deltaY)
-		if err := chromedp.Run(c.ctx, chromedp.Evaluate(js, nil)); err != nil {
+		if err := c.scroll(action); err != nil {
 			return nil, fmt.Errorf("scroll: %w", err)
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -261,6 +250,60 @@ func (c *Computer) Execute(action computer.Action) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unknown action: %s", action.Type)
 	}
+}
+
+// scroll dispatches a real CDP mouseWheel event at (x, y). This scrolls
+// whichever element is under the cursor — including nested scrollable
+// divs, virtualized lists, and pages where `window.scrollBy` no-ops
+// because the document body isn't the actual scroll container. Real
+// wheel events also fire DOM `wheel` handlers, so infinite-scroll and
+// chat/inbox UIs respond the way they do for a human.
+//
+// Falls back to window.scrollBy on error (e.g. CDP not available), so
+// the call never silently drops.
+func (c *Computer) scroll(a computer.Action) error {
+	amount := a.Amount
+	if amount <= 0 {
+		amount = 3
+	}
+	// 100 px per unit matches the old JS behavior. Chrome's default
+	// wheel tick is ~100 px, so amount=3 = ~3 ticks ≈ one "flick".
+	const step = 100
+	var dx, dy float64
+	switch strings.ToLower(a.Direction) {
+	case "up":
+		dy = float64(-step * amount)
+	case "down":
+		dy = float64(step * amount)
+	case "left":
+		dx = float64(-step * amount)
+	case "right":
+		dx = float64(step * amount)
+	default:
+		return fmt.Errorf("unknown scroll direction %q (want up/down/left/right)", a.Direction)
+	}
+
+	// Default target: center of the viewport. Callers that know what
+	// they're scrolling pass explicit x,y (e.g. scroll_at).
+	x, y := float64(a.X), float64(a.Y)
+	if x == 0 && y == 0 {
+		x = float64(c.display.Width) / 2
+		y = float64(c.display.Height) / 2
+	}
+
+	err := chromedp.Run(c.ctx,
+		input.DispatchMouseEvent(input.MouseWheel, x, y).
+			WithDeltaX(dx).WithDeltaY(dy),
+	)
+	if err == nil {
+		return nil
+	}
+
+	// Fallback: the old JS scroll. Better than dropping the action if
+	// the wheel event failed for some reason (off-screen, odd host).
+	fmt.Fprintf(os.Stderr, "[BROWSER] wheel dispatch failed (%v), falling back to window.scrollBy\n", err)
+	js := fmt.Sprintf("window.scrollBy(%d, %d)", int(dx), int(dy))
+	return chromedp.Run(c.ctx, chromedp.Evaluate(js, nil))
 }
 
 func (c *Computer) Screenshot() ([]byte, error) {

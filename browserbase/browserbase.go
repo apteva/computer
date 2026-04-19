@@ -9,9 +9,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/apteva/core/pkg/computer"
+	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/chromedp"
 )
 
@@ -325,19 +327,7 @@ func (c *Computer) Execute(action computer.Action) ([]byte, error) {
 		return c.Screenshot()
 
 	case "scroll":
-		deltaY := 0
-		amount := action.Amount
-		if amount == 0 {
-			amount = 3
-		}
-		switch action.Direction {
-		case "up":
-			deltaY = -100 * amount
-		case "down":
-			deltaY = 100 * amount
-		}
-		js := fmt.Sprintf("window.scrollBy(0, %d)", deltaY)
-		if err := chromedp.Run(c.ctx, chromedp.Evaluate(js, nil)); err != nil {
+		if err := c.scroll(action); err != nil {
 			return nil, fmt.Errorf("scroll: %w", err)
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -354,6 +344,48 @@ func (c *Computer) Execute(action computer.Action) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unknown action: %s", action.Type)
 	}
+}
+
+// scroll dispatches a real CDP mouseWheel event at (x, y). Browserbase
+// pages frequently have nested scroll containers (SaaS dashboards,
+// SPAs) where `window.scrollBy` is a no-op; wheel events scroll the
+// element under the cursor and fire wheel handlers like a human.
+func (c *Computer) scroll(a computer.Action) error {
+	amount := a.Amount
+	if amount <= 0 {
+		amount = 3
+	}
+	const step = 100
+	var dx, dy float64
+	switch strings.ToLower(a.Direction) {
+	case "up":
+		dy = float64(-step * amount)
+	case "down":
+		dy = float64(step * amount)
+	case "left":
+		dx = float64(-step * amount)
+	case "right":
+		dx = float64(step * amount)
+	default:
+		return fmt.Errorf("unknown scroll direction %q", a.Direction)
+	}
+
+	x, y := float64(a.X), float64(a.Y)
+	if x == 0 && y == 0 {
+		x = float64(c.display.Width) / 2
+		y = float64(c.display.Height) / 2
+	}
+
+	err := chromedp.Run(c.ctx,
+		input.DispatchMouseEvent(input.MouseWheel, x, y).
+			WithDeltaX(dx).WithDeltaY(dy),
+	)
+	if err == nil {
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "[BROWSERBASE] wheel dispatch failed (%v), falling back to window.scrollBy\n", err)
+	js := fmt.Sprintf("window.scrollBy(%d, %d)", int(dx), int(dy))
+	return chromedp.Run(c.ctx, chromedp.Evaluate(js, nil))
 }
 
 func (c *Computer) dispatchClick(x, y, clickCount int) error {
