@@ -10,10 +10,13 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/apteva/computer/som"
 	"github.com/apteva/core/pkg/computer"
 	"github.com/chromedp/cdproto/input"
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 )
 
@@ -57,21 +60,32 @@ type Options struct {
 type Computer struct {
 	apiKey      string
 	projectID   string
+	opts        Options
 	sessionID   string
+	contextID   string
 	debugURL    string
 	display     computer.DisplaySize
 	ctx         context.Context
 	cancel      context.CancelFunc
 	allocCancel context.CancelFunc
 	http        *http.Client
+
+	// SoM: same wiring as local.Computer. See local.go for rationale.
+	labelMu    sync.RWMutex
+	lastLabels map[int]som.Element
 }
 
-// New creates a Browserbase-backed Computer, starts a session, and connects via CDP.
+// New constructs a Browserbase-backed Computer. NO session is created
+// yet — the agent picks the binding (anonymous, context, or attach to
+// session id) via the first browser_session.open call, which routes
+// through OpenSession.
 func New(apiKey, projectID string, display computer.DisplaySize) (*Computer, error) {
 	return NewWithOptions(apiKey, projectID, display, Options{})
 }
 
-// NewWithOptions is New plus the extended configuration in Options.
+// NewWithOptions stores provider-level configuration (Region, Timeout,
+// KeepAlive, Fingerprint, …) for use at session-create time. Like New,
+// it does NOT create a session — that's deferred to OpenSession.
 func NewWithOptions(apiKey, projectID string, display computer.DisplaySize, opts Options) (*Computer, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("browserbase: api_key is required")
@@ -81,50 +95,13 @@ func NewWithOptions(apiKey, projectID string, display computer.DisplaySize, opts
 		// instead of surfacing a confusing HTTP 400 from the server.
 		return nil, fmt.Errorf("browserbase: project_id is required")
 	}
-
-	c := &Computer{
+	return &Computer{
 		apiKey:    apiKey,
 		projectID: projectID,
+		opts:      opts,
 		display:   display,
 		http:      &http.Client{Timeout: 30 * time.Second},
-	}
-
-	connectURL, err := c.createSession(opts)
-	if err != nil {
-		return nil, fmt.Errorf("browserbase: create session: %w", err)
-	}
-
-	// Connect via chromedp remote allocator. NoModifyURL stops chromedp
-	// from probing /json/version on the Browserbase proxy (it doesn't
-	// serve that endpoint).
-	allocCtx, allocCancel := chromedp.NewRemoteAllocator(context.Background(), connectURL,
-		chromedp.NoModifyURL)
-	c.allocCancel = allocCancel
-
-	ctx, cancel := chromedp.NewContext(allocCtx)
-	c.ctx = ctx
-	c.cancel = cancel
-
-	// Verify connection by running a simple command
-	if err := chromedp.Run(ctx); err != nil {
-		allocCancel()
-		cancel()
-		return nil, fmt.Errorf("browserbase: connect: %w", err)
-	}
-
-	// Best-effort fetch the live debugger URL. Useful for the TUI /
-	// dashboard "watch live" link. Missing or failing shouldn't abort
-	// the session — the browser still works, we just can't observe it.
-	if dbg, err := c.fetchDebugURL(); err == nil {
-		c.debugURL = dbg
-	} else {
-		fmt.Fprintf(os.Stderr, "[BROWSERBASE] debug URL unavailable: %v\n", err)
-	}
-
-	fmt.Fprintf(os.Stderr, "[BROWSERBASE] session ready id=%s debug=%s display=%dx%d\n",
-		c.sessionID, c.debugURL, display.Width, display.Height)
-
-	return c, nil
+	}, nil
 }
 
 // sessionCreateRequest is the POST /v1/sessions payload. Fields match
@@ -149,29 +126,52 @@ type sessionCreateResponse struct {
 	// read the fields we use.
 }
 
-func (c *Computer) createSession(opts Options) (string, error) {
+func (c *Computer) createSession(o computer.OpenOptions) (string, error) {
 	bs := map[string]any{
 		"viewport": map[string]int{
 			"width":  c.display.Width,
 			"height": c.display.Height,
 		},
 	}
-	if opts.Fingerprint != nil {
-		bs["fingerprint"] = opts.Fingerprint
+	if c.opts.Fingerprint != nil {
+		bs["fingerprint"] = c.opts.Fingerprint
 	}
-	if opts.SolveCaptchas {
+	if c.opts.SolveCaptchas {
 		bs["solveCaptchas"] = true
 	}
+	if o.ContextID != "" {
+		bs["context"] = map[string]any{
+			"id":      o.ContextID,
+			"persist": o.Persist,
+		}
+	}
 
+	timeout := c.opts.Timeout
+	if o.Timeout > 0 {
+		timeout = o.Timeout
+	}
+	// Agent's per-call OpenOptions.Proxy wins over the harness default.
+	// Browserbase encodes "true" as the managed residential proxy; a
+	// custom proxy list can also be passed via Options.Proxies (kept
+	// in c.opts.Proxies). ProxyCountry is not honored here — it
+	// requires a custom proxy list, not the boolean flag.
+	proxies := c.opts.Proxies
+	if o.Proxy != nil {
+		if *o.Proxy {
+			proxies = true
+		} else {
+			proxies = nil
+		}
+	}
 	req := sessionCreateRequest{
 		ProjectID:       c.projectID,
 		BrowserSettings: bs,
-		KeepAlive:       opts.KeepAlive,
-		Region:          opts.Region,
-		Timeout:         opts.Timeout,
-		Proxies:         opts.Proxies,
-		ExtensionID:     opts.ExtensionID,
-		UserMetadata:    opts.UserMetadata,
+		KeepAlive:       c.opts.KeepAlive,
+		Region:          c.opts.Region,
+		Timeout:         timeout,
+		Proxies:         proxies,
+		ExtensionID:     c.opts.ExtensionID,
+		UserMetadata:    c.opts.UserMetadata,
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -287,6 +287,9 @@ func (c *Computer) requestRelease() error {
 }
 
 func (c *Computer) Execute(action computer.Action) ([]byte, error) {
+	if c.ctx == nil {
+		return nil, fmt.Errorf("browserbase: no active session — call browser_session open first")
+	}
 	switch action.Type {
 	case "screenshot":
 		return c.Screenshot()
@@ -299,22 +302,58 @@ func (c *Computer) Execute(action computer.Action) ([]byte, error) {
 		return c.Screenshot()
 
 	case "click":
-		if err := c.dispatchClick(action.X, action.Y, 1); err != nil {
+		// SoM: label=N takes precedence over x,y.
+		x, y := action.X, action.Y
+		if action.Label != 0 {
+			if e, ok := c.resolveLabel(action.Label); ok {
+				x, y = e.Center()
+			}
+		}
+		if err := c.dispatchClick(x, y, 1); err != nil {
 			return nil, fmt.Errorf("click: %w", err)
+		}
+		// Explicit focus at the click point — same rationale as the
+		// local package: CDP mouse events don't reliably move DOM
+		// focus to form inputs, so later type/insertText can no-op
+		// silently. Best-effort; errors ignored so plain clicks on
+		// non-focusable elements still succeed.
+		focusJS := fmt.Sprintf(`(function(){
+			var el = document.elementFromPoint(%d, %d);
+			if (el && typeof el.focus === 'function') { el.focus(); return el.tagName; }
+			return null;
+		})()`, x, y)
+		var focusedTag string
+		_ = chromedp.Run(c.ctx, chromedp.Evaluate(focusJS, &focusedTag))
+		if focusedTag != "" {
+			fmt.Fprintf(os.Stderr, "[BROWSERBASE] click focused <%s>\n", strings.ToLower(focusedTag))
 		}
 		time.Sleep(200 * time.Millisecond)
 		return c.Screenshot()
 
 	case "double_click":
-		if err := c.dispatchClick(action.X, action.Y, 2); err != nil {
+		x, y := action.X, action.Y
+		if action.Label != 0 {
+			if e, ok := c.resolveLabel(action.Label); ok {
+				x, y = e.Center()
+			}
+		}
+		if err := c.dispatchClick(x, y, 2); err != nil {
 			return nil, fmt.Errorf("double_click: %w", err)
 		}
 		time.Sleep(200 * time.Millisecond)
 		return c.Screenshot()
 
 	case "type":
-		if err := chromedp.Run(c.ctx, chromedp.KeyEvent(action.Text)); err != nil {
-			return nil, fmt.Errorf("type: %w", err)
+		// Same rationale as the local package: Input.insertText is
+		// the reliable modern path for text entry (paste-like, fires
+		// real input/change events, forgives imprecise focus).
+		// KeyEvent fallback for cases with no editable focus.
+		err := chromedp.Run(c.ctx, input.InsertText(action.Text))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[BROWSERBASE] insertText failed (%v), falling back to KeyEvent\n", err)
+			if err := chromedp.Run(c.ctx, chromedp.KeyEvent(action.Text)); err != nil {
+				return nil, fmt.Errorf("type: %w", err)
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 		return c.Screenshot()
@@ -395,11 +434,74 @@ func (c *Computer) dispatchClick(x, y, clickCount int) error {
 }
 
 func (c *Computer) Screenshot() ([]byte, error) {
+	if c.ctx == nil {
+		return nil, fmt.Errorf("browserbase: no active session — call browser_session open first")
+	}
+	// Viewport-only screenshot. See local.go for the full rationale:
+	// FullScreenshot returns the entire scrollable page, which then
+	// either gets aspect-squashed to viewport (silently distorting
+	// coordinates) or sent to the LLM at page dimensions that don't
+	// match the viewport the agent clicks into. page.CaptureScreenshot
+	// returns exactly the visible area at the configured resolution.
 	var buf []byte
-	if err := chromedp.Run(c.ctx, chromedp.FullScreenshot(&buf, 90)); err != nil {
+	err := chromedp.Run(c.ctx,
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			b, err := page.CaptureScreenshot().
+				WithFormat(page.CaptureScreenshotFormatJpeg).
+				WithQuality(90).
+				Do(ctx)
+			if err != nil {
+				return err
+			}
+			buf = b
+			return nil
+		}),
+	)
+	if err != nil {
 		return nil, fmt.Errorf("screenshot: %w", err)
 	}
+
+	// SoM annotation — same pipeline as local.Screenshot. Off unless
+	// APTEVA_SOM=1; any failure returns the raw screenshot.
+	if som.Enabled() {
+		var raw json.RawMessage
+		if err := chromedp.Run(c.ctx, chromedp.Evaluate(som.EnumScript, &raw)); err != nil {
+			fmt.Fprintf(os.Stderr, "[BROWSERBASE] som enum failed: %v\n", err)
+			return buf, nil
+		}
+		elements, err := som.UnmarshalElements(raw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[BROWSERBASE] som parse failed: %v\n", err)
+			return buf, nil
+		}
+		m := make(map[int]som.Element, len(elements))
+		for _, e := range elements {
+			m[e.Label] = e
+		}
+		c.labelMu.Lock()
+		c.lastLabels = m
+		c.labelMu.Unlock()
+
+		annotated, aerr := som.Annotate(buf, elements)
+		if aerr != nil {
+			fmt.Fprintf(os.Stderr, "[BROWSERBASE] som annotate failed: %v\n", aerr)
+			return buf, nil
+		}
+		fmt.Fprintf(os.Stderr, "[BROWSERBASE] som annotated: %d elements\n", len(elements))
+		return annotated, nil
+	}
 	return buf, nil
+}
+
+// resolveLabel mirrors local.resolveLabel.
+func (c *Computer) resolveLabel(label int) (som.Element, bool) {
+	c.labelMu.RLock()
+	defer c.labelMu.RUnlock()
+	if c.lastLabels == nil {
+		return som.Element{}, false
+	}
+	e, ok := c.lastLabels[label]
+	return e, ok
 }
 
 func (c *Computer) DisplaySize() computer.DisplaySize { return c.display }
@@ -407,6 +509,7 @@ func (c *Computer) DisplaySize() computer.DisplaySize { return c.display }
 // SessionInfo implementation
 func (c *Computer) SessionType() string { return "browserbase" }
 func (c *Computer) SessionID() string   { return c.sessionID }
+func (c *Computer) ContextID() string   { return c.contextID }
 func (c *Computer) CurrentURL() string {
 	var url string
 	_ = chromedp.Run(c.ctx, chromedp.Location(&url))
@@ -417,6 +520,151 @@ func (c *Computer) CurrentURL() string {
 // if not available. Callers can type-assert against this method to expose
 // a "watch live" link in UIs without widening the core Computer interface.
 func (c *Computer) DebugURL() string { return c.debugURL }
+
+// OpenSession establishes a session matching opts and (if a URL is
+// given) navigates to it. Implements computer.SessionOpener — this is
+// the agent-runtime entry point for create-with-context, attach-by-id,
+// and rebind-to-different-context. Idempotent when opts match the
+// current binding (no-op or just navigate). Otherwise tears down the
+// current session before establishing the new one.
+func (c *Computer) OpenSession(o computer.OpenOptions) error {
+	if o.SessionID != "" && o.ContextID != "" {
+		return fmt.Errorf("browserbase: SessionID and ContextID are mutually exclusive")
+	}
+	// Fast path: caller wants the same session/context we already have.
+	if c.sessionID != "" {
+		sameSession := o.SessionID != "" && o.SessionID == c.sessionID
+		sameContext := o.SessionID == "" && o.ContextID != "" && o.ContextID == c.contextID
+		if sameSession || sameContext {
+			if o.URL != "" {
+				return c.navigate(o.URL)
+			}
+			return nil
+		}
+		// Different binding — drop the current connection. The previous
+		// Browserbase session is left to time out (or release on Close).
+		c.releaseCDP()
+		c.sessionID = ""
+		c.contextID = ""
+		c.debugURL = ""
+	}
+
+	var connectURL string
+	if o.SessionID != "" {
+		u, err := c.fetchSessionConnectURL(o.SessionID)
+		if err != nil {
+			return fmt.Errorf("browserbase: lookup session %s: %w", o.SessionID, err)
+		}
+		connectURL = u
+		c.sessionID = o.SessionID
+	} else {
+		u, err := c.createSession(o)
+		if err != nil {
+			return fmt.Errorf("browserbase: create session: %w", err)
+		}
+		connectURL = u
+		// c.sessionID is set inside createSession.
+		if o.ContextID != "" {
+			c.contextID = o.ContextID
+		}
+	}
+	if err := c.establishCDP(connectURL); err != nil {
+		return fmt.Errorf("browserbase: connect: %w", err)
+	}
+	if dbg, derr := c.fetchDebugURL(); derr == nil {
+		c.debugURL = dbg
+	} else {
+		fmt.Fprintf(os.Stderr, "[BROWSERBASE] debug URL unavailable: %v\n", derr)
+	}
+	fmt.Fprintf(os.Stderr, "[BROWSERBASE] session ready id=%s context=%s debug=%s display=%dx%d\n",
+		c.sessionID, c.contextID, c.debugURL, c.display.Width, c.display.Height)
+	if o.URL != "" {
+		return c.navigate(o.URL)
+	}
+	return nil
+}
+
+// Resume is a thin wrapper around OpenSession for callers that hold the
+// older Resumable interface. Same code path as OpenSession({SessionID}).
+func (c *Computer) Resume(sessionID string) error {
+	return c.OpenSession(computer.OpenOptions{SessionID: sessionID})
+}
+
+// establishCDP wires up the chromedp remote-allocator + context for the
+// given Browserbase connectURL. Tears down on failure.
+func (c *Computer) establishCDP(connectURL string) error {
+	allocCtx, allocCancel := chromedp.NewRemoteAllocator(context.Background(), connectURL,
+		chromedp.NoModifyURL)
+	ctx, cancel := chromedp.NewContext(allocCtx)
+	if err := chromedp.Run(ctx); err != nil {
+		cancel()
+		allocCancel()
+		return err
+	}
+	c.allocCancel = allocCancel
+	c.ctx = ctx
+	c.cancel = cancel
+	return nil
+}
+
+// releaseCDP cancels the chromedp context + allocator. Safe to call
+// when no session is attached (no-op).
+func (c *Computer) releaseCDP() {
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
+	}
+	if c.allocCancel != nil {
+		c.allocCancel()
+		c.allocCancel = nil
+	}
+	c.ctx = nil
+}
+
+// navigate is a small CDP nav wrapper used by OpenSession after a
+// successful attach/create.
+func (c *Computer) navigate(url string) error {
+	if c.ctx == nil {
+		return fmt.Errorf("browserbase: no active session — cannot navigate")
+	}
+	_, err := c.Execute(computer.Action{Type: "navigate", URL: url})
+	return err
+}
+
+// fetchSessionConnectURL hits GET /v1/sessions/{id} and returns its
+// connectUrl, erroring if the session is no longer RUNNING.
+func (c *Computer) fetchSessionConnectURL(sessionID string) (string, error) {
+	url := fmt.Sprintf("%s/sessions/%s", apiBase, sessionID)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-BB-API-Key", c.apiKey)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var result struct {
+		ID         string `json:"id"`
+		Status     string `json:"status"`
+		ConnectURL string `json:"connectUrl"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if result.Status != "" && result.Status != "RUNNING" {
+		return "", fmt.Errorf("session %s is %s, not RUNNING (was KeepAlive set?)", sessionID, result.Status)
+	}
+	if result.ConnectURL == "" {
+		return "", fmt.Errorf("session %s has no connectUrl", sessionID)
+	}
+	return result.ConnectURL, nil
+}
 
 func (c *Computer) Close() error {
 	if c.cancel != nil {
