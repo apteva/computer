@@ -58,8 +58,28 @@ func (e Element) Center() (int, int) {
 
 // EnumScript is injected into the page's main world via
 // chromedp.Evaluate. It returns a JSON array of visible interactive
-// elements, capped at 50, sorted by area descending so the most
-// prominent UI remains labeled if the cap trims anything.
+// elements, capped at 50, ranked by an importance score (element
+// type weight × area-tiebreaker) so the most likely click targets
+// get the lowest labels.
+//
+// Smarts beyond a flat selector list — these matter on
+// component-heavy UIs (Patreon, Notion, Linear, Twitter):
+//
+//  Nested-clickable dedup. <div onclick><input/></div> emits one
+//  label (the input), not two — agents historically picked the
+//  wrong one. Same for <button><svg/></button>: just the button.
+//
+//  Occlusion-aware. Modal overlays (Patreon's GDPR popup, Twitter's
+//  "What's happening" toast) hide elements behind them at click-time
+//  but the DOM still enumerates them. We sample
+//  document.elementFromPoint at each candidate's center; if a
+//  different element is on top, the candidate is hidden and we
+//  drop it. The agent sees only what it can actually click.
+//
+//  Type-weighted ranking. Pure area-DESC put gigantic background
+//  containers at label=1. Now: inputs/selects/textareas (5) >
+//  buttons (4) > anchors (3) > role=button/link (2) > generic
+//  onclick/tabindex (1). Area is the within-tier tiebreaker.
 //
 // Read-only: queries DOM, reads layout, reads computed style. No
 // mutations, no listeners, no globals. Safe against MutationObserver.
@@ -69,46 +89,316 @@ const EnumScript = `
     'a[href]','button','input:not([type=hidden])','select','textarea',
     '[role=button]','[role=link]','[role=menuitem]','[role=tab]',
     '[role=checkbox]','[role=radio]','[role=switch]','[role=combobox]',
-    '[role=option]','[role=treeitem]',
+    '[role=option]','[role=treeitem]','[role=textbox]','[role=searchbox]',
+    // contenteditable catches Slate.js / Lexical / ProseMirror /
+    // TinyMCE / Quill / etc. rich-text editors. Patreon's body
+    // editor in particular is a contenteditable div with no role.
+    '[contenteditable=true]','[contenteditable=""]',
     '[onclick]','[tabindex]:not([tabindex="-1"])'
   ];
   var vw = window.innerWidth, vh = window.innerHeight;
-  var out = [];
+
+  // priority: lower number = wrapper / generic, higher = real input
+  // element. Used for both sort ranking and contains-dedup.
+  function priority(tag, role, el) {
+    // contenteditable counts as a top-tier text input — it's the
+    // body of rich editors (Slate/Lexical/ProseMirror).
+    if (el && el.isContentEditable) return 5;
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return 5;
+    if (role === 'textbox' || role === 'searchbox') return 5;
+    if (tag === 'button') return 4;
+    if (tag === 'a') return 3;
+    if (role === 'button' || role === 'link' || role === 'menuitem' ||
+        role === 'tab' || role === 'checkbox' || role === 'radio' ||
+        role === 'switch' || role === 'combobox' || role === 'option' ||
+        role === 'treeitem') return 2;
+    return 1; // bare onclick / tabindex
+  }
+
+  // ─── Pass 1: gather all visible candidates ───────────────────
+  // Walks: main document + every same-origin iframe + open shadow
+  // roots reachable from the main document. Cookie banners
+  // (Cookiebot, OneTrust, Patreon's own banner) frequently render
+  // inside iframes/shadow trees; without this walk their buttons
+  // are invisible to the agent.
+  var candidates = [];
   var seen = new WeakSet();
-  for (var i = 0; i < selectors.length; i++) {
-    var els = document.querySelectorAll(selectors[i]);
-    for (var j = 0; j < els.length; j++) {
-      var el = els[j];
-      if (seen.has(el)) continue;
-      seen.add(el);
-      var r = el.getBoundingClientRect();
-      if (r.width < 4 || r.height < 4) continue;
-      if (r.right <= 0 || r.bottom <= 0) continue;
-      if (r.left >= vw || r.top >= vh) continue;
-      var style = window.getComputedStyle(el);
-      if (style.visibility === 'hidden' || style.display === 'none') continue;
-      if (parseFloat(style.opacity) < 0.1) continue;
-      if (el.disabled) continue;
-      var x = Math.max(0, Math.round(r.left));
-      var y = Math.max(0, Math.round(r.top));
-      var w = Math.min(vw, Math.round(r.right)) - x;
-      var h = Math.min(vh, Math.round(r.bottom)) - y;
-      var text = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim();
-      if (text.length > 40) text = text.substr(0, 40);
-      out.push({
-        x: x, y: y, w: w, h: h,
-        tag: el.tagName.toLowerCase(),
-        role: el.getAttribute('role') || '',
-        text: text,
-        type: el.type || ''
-      });
+
+  // gatherFrom — collect candidates from a Document or ShadowRoot.
+  // Coordinates returned by getBoundingClientRect on elements
+  // INSIDE a same-origin iframe are LOCAL to that iframe's
+  // viewport; offsetX/offsetY translate them into main-viewport
+  // pixels so the agent's click coordinates map correctly.
+  // styleWin is the window scope used for getComputedStyle —
+  // matters because the iframe's own window has its own CSSOM.
+  function gatherFrom(root, offsetX, offsetY, styleWin) {
+    for (var si = 0; si < selectors.length; si++) {
+      var els;
+      try { els = root.querySelectorAll(selectors[si]); } catch (e) { continue; }
+      for (var ei = 0; ei < els.length; ei++) {
+        var el = els[ei];
+        if (seen.has(el)) continue;
+        seen.add(el);
+        var r;
+        try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+        if (r.width < 4 || r.height < 4) continue;
+        // Cull post-translation against main viewport.
+        var rLeft = r.left + offsetX;
+        var rTop = r.top + offsetY;
+        var rRight = r.right + offsetX;
+        var rBottom = r.bottom + offsetY;
+        if (rRight <= 0 || rBottom <= 0) continue;
+        if (rLeft >= vw || rTop >= vh) continue;
+        var style;
+        try { style = styleWin.getComputedStyle(el); } catch (e) { continue; }
+        if (style.visibility === 'hidden' || style.display === 'none') continue;
+        if (parseFloat(style.opacity) < 0.1) continue;
+        if (el.disabled) continue;
+        var x = Math.max(0, Math.round(rLeft));
+        var y = Math.max(0, Math.round(rTop));
+        var w = Math.min(vw, Math.round(rRight)) - x;
+        var h = Math.min(vh, Math.round(rBottom)) - y;
+        var text = (el.innerText || el.value ||
+                    el.getAttribute('aria-label') ||
+                    el.getAttribute('aria-placeholder') ||
+                    el.getAttribute('placeholder') ||
+                    el.getAttribute('data-placeholder') ||
+                    el.getAttribute('data-text') ||
+                    '').trim();
+        // Rich-text editors (Slate.js, Lexical, ProseMirror) render
+        // their placeholder via a CSS ::before pseudo-element instead
+        // of any DOM attribute — el.innerText is empty until the
+        // user types. Read the computed pseudo-element content so the
+        // agent sees "Start writing..." / "Type here" / etc. on the
+        // body-editor label and can recognise it as a textbox.
+        if (!text && (el.isContentEditable || (el.getAttribute && el.getAttribute('role') === 'textbox'))) {
+          try {
+            var pseudo = styleWin.getComputedStyle(el, '::before');
+            var content = pseudo && pseudo.content;
+            if (content && content !== 'none' && content !== 'normal' && content !== '""' && content !== "''") {
+              // CSS content values are quoted ("Start writing…"). Strip
+              // the surrounding quotes; ignore counter/var() shapes.
+              var stripped = content.replace(/^attr\(.+\)$/, '');
+              if (/^["'][\s\S]*["']$/.test(stripped)) {
+                text = stripped.slice(1, -1).trim();
+              }
+            }
+          } catch (e) { /* cross-origin or detached */ }
+        }
+        if (text.length > 40) text = text.substr(0, 40);
+        var tag = el.tagName.toLowerCase();
+        var role = el.getAttribute('role') || '';
+        candidates.push({
+          el: el, x: x, y: y, w: w, h: h,
+          tag: tag, role: role, text: text,
+          type: el.type || '',
+          prio: priority(tag, role, el)
+        });
+      }
     }
   }
-  out.sort(function(a, b) { return (b.w * b.h) - (a.w * a.h); });
-  if (out.length > 50) out = out.slice(0, 50);
-  // Assign stable labels AFTER sort — this is the label the agent
-  // sees on the screenshot.
-  for (var k = 0; k < out.length; k++) out[k].label = k + 1;
+
+  // Main document.
+  gatherFrom(document, 0, 0, window);
+
+  // Same-origin iframes. Cross-origin throws on contentDocument
+  // access — we silently skip those (and label the iframe element
+  // itself if it matched a selector, which it doesn't by default;
+  // future improvement: add iframe to selector list as a fallback).
+  var iframes = document.querySelectorAll('iframe');
+  for (var fi = 0; fi < iframes.length; fi++) {
+    var ifr = iframes[fi];
+    var ifrRect;
+    try { ifrRect = ifr.getBoundingClientRect(); } catch (e) { continue; }
+    if (ifrRect.width < 4 || ifrRect.height < 4) continue;
+    if (ifrRect.right <= 0 || ifrRect.bottom <= 0) continue;
+    if (ifrRect.left >= vw || ifrRect.top >= vh) continue;
+    var doc, win;
+    try {
+      doc = ifr.contentDocument;
+      win = ifr.contentWindow;
+    } catch (e) { continue; }
+    if (!doc || !win) continue;
+    gatherFrom(doc, ifrRect.left, ifrRect.top, win);
+  }
+
+  // Open shadow roots reachable from the main document. Closed
+  // shadow roots are inaccessible by design — those stay invisible.
+  // Coordinates are in main-viewport space (shadow DOM renders
+  // within the host's box), so no offset translation needed.
+  var hosts = document.querySelectorAll('*');
+  for (var hi = 0; hi < hosts.length; hi++) {
+    var host = hosts[hi];
+    var sr;
+    try { sr = host.shadowRoot; } catch (e) { continue; }
+    if (!sr) continue;
+    gatherFrom(sr, 0, 0, window);
+  }
+
+  // ─── Pass 1.5: modal-aware suppression ───────────────────────
+  // When a modal/dialog is open, the page-behind-it is visually
+  // covered but the DOM still enumerates it. Sidebar buttons and
+  // background controls are technically still clickable (a click
+  // there closes most modals via outside-click) but they're NEVER
+  // the right next action for an agent navigating the modal flow.
+  //
+  // Concrete bug we hit: agent opening Patreon's video-embed
+  // dialog typed the URL into a sidebar's "Paid access" radio
+  // (which has the same input-tier badge color) instead of the
+  // dialog's URL field, because both labels were equally available
+  // and the dialog one wasn't visually privileged.
+  //
+  // Detection: look for an explicit dialog container. If found,
+  // drop candidates whose center isn't inside its bbox. Heuristics:
+  //   1. [role=dialog] — the canonical signal
+  //   2. [aria-modal="true"] — same intent, different attr
+  //   3. <dialog open> — native HTML dialog element
+  //
+  // We deliberately do NOT use a generic "fixed-position big-box"
+  // heuristic — it false-positives on toolbars, footers, sidebars.
+  // If the page doesn't expose a real dialog role, we leave the
+  // map untouched (agents still recover via skill / coordinate
+  // fallback).
+  function findActiveModal() {
+    var candidates = [];
+    var nodes = document.querySelectorAll('[role=dialog],[aria-modal="true"],dialog[open]');
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var r = n.getBoundingClientRect();
+      // Visible + non-trivial size + on-screen
+      if (r.width < 100 || r.height < 80) continue;
+      if (r.right <= 0 || r.bottom <= 0 || r.left >= vw || r.top >= vh) continue;
+      var s = window.getComputedStyle(n);
+      if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity) < 0.1) continue;
+      candidates.push({el: n, rect: r, area: r.width * r.height});
+    }
+    if (candidates.length === 0) return null;
+    // Multiple modals stacked? Prefer the one with HIGHEST z-index
+    // (last in DOM order is also a fine tiebreaker; CSS painters use
+    // both).
+    candidates.sort(function(a, b){
+      var za = parseInt(window.getComputedStyle(a.el).zIndex, 10) || 0;
+      var zb = parseInt(window.getComputedStyle(b.el).zIndex, 10) || 0;
+      return zb - za;
+    });
+    return candidates[0];
+  }
+  var activeModal = findActiveModal();
+  if (activeModal) {
+    var mb = activeModal.rect;
+    candidates = candidates.filter(function(c) {
+      // Keep candidates whose center is inside the modal box. Also
+      // keep the modal element's descendants explicitly (defensive
+      // against tight-fitting modals where the math is off-by-a-pixel).
+      var cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+      var insideBox = cx >= mb.left && cx <= mb.right && cy >= mb.top && cy <= mb.bottom;
+      var insideTree = activeModal.el.contains(c.el);
+      return insideBox || insideTree;
+    });
+  }
+
+  // ─── Pass 2: nested-clickable dedup ──────────────────────────
+  // Drop a candidate if it CONTAINS another candidate of equal or
+  // higher priority (the contained one is the more specific target,
+  // so the wrapper is redundant). Also drop a candidate if it is
+  // CONTAINED in another candidate of strictly higher priority (the
+  // outer is the real target; the inner is decorative — e.g. a
+  // tabindex span inside a button).
+  var keep = [];
+  for (var i = 0; i < candidates.length; i++) {
+    var ci = candidates[i];
+    var dominated = false;
+    for (var j = 0; j < candidates.length && !dominated; j++) {
+      if (i === j) continue;
+      var cj = candidates[j];
+      if (ci.el.contains(cj.el) && cj.prio >= ci.prio) {
+        dominated = true; break;  // ci is a wrapper
+      }
+      if (cj.el.contains(ci.el) && cj.prio > ci.prio) {
+        dominated = true; break;  // ci is decorative inside a stronger target
+      }
+    }
+    if (!dominated) keep.push(ci);
+  }
+
+  // ─── Pass 3: occlusion check (lenient — false positives hurt) ─
+  // Modal overlays cover elements; the DOM still lists them, but
+  // they're not clickable. We sample elementFromPoint at three
+  // points along the candidate's horizontal centerline.
+  //
+  // CRITICAL: cost asymmetry. A false-positive (pruning a real
+  // clickable) is much worse than a false-negative (keeping an
+  // un-clickable one). The agent loops and gets stuck on the first;
+  // recovers by trying another label on the second. So this check
+  // is intentionally LENIENT.
+  //
+  // We only prune a candidate when the topmost element at its
+  // center sample IS ITSELF a meaningful interactive (button,
+  // input, [role=button], onclick handler, etc.) AND is not the
+  // candidate's ancestor/descendant. A non-interactive wrapper
+  // div (decorative dimmer, layout container) lets the candidate
+  // through — clicks reach the candidate via pointer-events
+  // bubbling in most cases. We bias toward labeling, not toward
+  // pruning.
+  function isUsefulInteractive(el) {
+    if (!el) return false;
+    var t = el.tagName;
+    if (t === 'A' || t === 'BUTTON' || t === 'INPUT' ||
+        t === 'TEXTAREA' || t === 'SELECT') return true;
+    if (el.getAttribute('role')) return true;
+    if (el.hasAttribute('onclick')) return true;
+    var ti = el.getAttribute('tabindex');
+    if (ti !== null && ti !== '-1') return true;
+    return false;
+  }
+  var visible = [];
+  for (var i = 0; i < keep.length; i++) {
+    var c = keep[i];
+    var probes = [
+      [c.x + c.w / 2, c.y + c.h / 2],
+      [c.x + Math.max(2, Math.min(c.w - 2, c.w * 0.25)), c.y + c.h / 2],
+      [c.x + Math.max(2, Math.min(c.w - 2, c.w * 0.75)), c.y + c.h / 2]
+    ];
+    var pruned = false;
+    for (var p = 0; p < probes.length && !pruned; p++) {
+      var px = probes[p][0], py = probes[p][1];
+      if (px < 0 || py < 0 || px >= vw || py >= vh) continue;
+      var top = document.elementFromPoint(px, py);
+      if (!top) continue;
+      // Topmost relates to the candidate (self/descendant/ancestor)
+      // → not occluded.
+      if (top === c.el || c.el.contains(top) || top.contains(c.el)) {
+        continue;
+      }
+      // Topmost is unrelated. Only prune if it's a real interactive
+      // — otherwise treat as decorative pass-through and KEEP the
+      // candidate.
+      if (isUsefulInteractive(top)) {
+        pruned = true;
+      }
+    }
+    if (!pruned) visible.push(c);
+  }
+
+  // ─── Pass 4: rank, cap, label ────────────────────────────────
+  // Score = priority × big-multiplier + log(area). Priority dominates
+  // strictly; area is the tiebreaker so same-tier elements stay in
+  // a sensible order (Publish button beats hidden secondary actions).
+  function score(c) { return c.prio * 1e6 + Math.sqrt(c.w * c.h); }
+  visible.sort(function(a, b) { return score(b) - score(a); });
+  if (visible.length > 50) visible = visible.slice(0, 50);
+
+  // Strip the el reference (not JSON-encodable + serializing DOM
+  // nodes hangs chromedp.Evaluate) and assign final labels.
+  var out = [];
+  for (var k = 0; k < visible.length; k++) {
+    var c = visible[k];
+    out.push({
+      x: c.x, y: c.y, w: c.w, h: c.h,
+      tag: c.tag, role: c.role, text: c.text, type: c.type,
+      label: k + 1
+    });
+  }
   return out;
 })()
 `
